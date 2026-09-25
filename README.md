@@ -1,35 +1,86 @@
-# Qwen3.8-Flash-Next NVFP4 (109 GB, single-GPU vLLM)
+# Jalapeño — Qwen3.8-Flash-Next on a DGX Spark, fast
 
-Qwen3.8-Flash-Next is a 335 GB model. This is a 109 GB NVFP4 quantization of it
-that runs through vLLM on a single 121 GB GPU (built and tested on an NVIDIA DGX
-Spark, GB10/sm121).
+A tuned vLLM stack that runs the 335 GB **Qwen3.8-Flash-Next** on a single
+**NVIDIA DGX Spark** (GB10, 121 GB unified memory) as a full OpenAI-compatible
+endpoint — tool calling, reasoning parsing, prefix caching, 200K context,
+speculative decoding — together with the patch campaign ("Project Jalapeño")
+that took single-stream decode from **24.2 → ~38 accepted tok/s (+57 %)**
+with quality gates green throughout (13/13 battery, KL ≤ 0.012 vs BF16).
 
-This repository contains the quantization recipe, the vLLM patches required to
-load the checkpoint, the serving configuration, and the verification scripts.
-The weights themselves live on Hugging Face:
-[starkweatherdigital/qwen3.8-flash-next-nvfp4](https://huggingface.co/starkweatherdigital/qwen3.8-flash-next-nvfp4).
+Everything here ran in production on a real Spark for weeks before being
+published. No part of it is theoretical.
 
-**Start here: [docs/REPRODUCE.md](docs/REPRODUCE.md)** — the end-to-end guide,
-from the official 335 GB release to a served engine with speculative decoding,
-CUDA graphs, a 131K window and prefix caching all working, including the traps
-that cost us time.
+| | |
+|---|---|
+| Single-stream decode (accepted tok/s) | **37.3–38.0** (MTP=2, all optimizations) |
+| … before the campaign, same stack | 24.2 |
+| Concurrent streams (1 / 4 / 8 / 16) | 38.7 / 21.2 / 14.6 / 10.5 tok/s |
+| Agent-style fanout (8 parallel) | 23.8 tok/s aggregate, TTFT p90 6.1 s |
+| Inter-token latency p50 | 56.8 ms |
+| TTFT p50 (short prompts) | ~300 ms |
+| Context | 131,072 default · 204,800 in production |
+| Boot | ~6.5 min (198 s weight load) |
+| Decode power | ~32 W |
 
-## What was done
+The full evidence chain — every promotion, what it won, what was tried and
+rejected, and how the numbers were measured — is in
+[docs/PERFORMANCE.md](docs/PERFORMANCE.md).
 
-Existing server-format quants don't fit a single GPU because they keep the
-model's 51.2B-parameter n-gram (PLE) table at FP8 or wider (102.4 GB at BF16).
-Two changes close the gap:
+## Quickstart
 
-1. **The PLE table is quantized to NVFP4 (4-bit)** — 28.80 GB instead of
-   102.4 GB — using the same E2M1 + per-16 FP8-block-scale layout as the
-   experts. llama.cpp GGUFs already ship ~4-bit n-gram tables, so the quality
-   precedent existed; this applies it in ModelOpt format.
-2. **A small vLLM loader patch** (`patches/20-ple-4bit-loader.patch`, ~130
-   lines, env-gated behind `VLLM_PLE_NVFP4=1`) teaches vLLM to load the packed
-   4-bit table. vLLM has no quantized-PLE loading of its own; this is the part
-   that makes the checkpoint actually usable.
+You need: a DGX Spark (any 121 GB GB10 works), Docker with the NVIDIA
+runtime (the Spark ships with it), ~110 GB of NVMe for weights, and `pip
+install huggingface_hub[cli]` for the download.
 
-Sizes for context:
+```bash
+# 1. Weights (109 GB, public): the only single-GPU vLLM quant of this model.
+hf download starkweatherdigital/qwen3.8-flash-next-nvfp4 \
+   --local-dir /mnt/models/qwen3.8-flash-next-nvfp4
+
+# 2. Engine image: the 11 patches applied over a digest-pinned vLLM base.
+#    (The base is a 30 GB pull; the patch step itself is seconds.)
+docker build -t jalapeno/vllm-gb10-flashnext:0.28-sm121-r9 .
+
+# 3. Serve. Defaults are the production-validated configuration.
+cp .env.example .env        # then set MODEL_DIR to the path from step 1
+docker compose up -d
+docker compose logs -f      # ~6.5 min to healthy — it's loading 76 GB of weights
+
+# 4. Smoke test (stdlib only, runs on the host):
+python3 serve/gates.py --url http://localhost:8006/v1
+```
+
+Then point anything OpenAI-compatible at `http://<spark>:8006/v1`, model name
+`qwen3.8-flash-next`, no API key:
+
+- **Open WebUI / LibreChat / any chat UI** — add an OpenAI connection.
+- **Agents and CLI tools** — reasoning output (`--reasoning-parser qwen3`) and
+  tool calls (`--tool-call-parser qwen3_coder`, auto tool choice) already
+  parse, so OpenAI-API agents work unmodified. Prefix caching makes
+  multi-turn agents cheap: cache hit rate is 56–70 % on conversation-shaped
+  traffic, and a cached turn drops from ~10 s to ~2–3 s of prefill.
+- **Sharing the box** — the compose file enables vLLM sleep mode, so
+  `POST /sleep` frees the GPU for another job and `POST /wake_up` brings the
+  engine back without a 6.5-minute reload.
+
+## Why this exists
+
+Three ideas make a 335 GB model fit and fly on a 121 GB Spark:
+
+1. **The 51.2B-parameter PLE n-gram table is quantized to NVFP4** (28.8 GB
+   instead of 102.4 GB) — every other published vLLM quant keeps it at FP8 or
+   wider, which is exactly why none of them fit one GPU. A ~130-line loader
+   patch teaches vLLM to read it.
+2. **The table is served from NVMe via mmap** rather than kept resident. A
+   token reads 16 rows × ~90 B, so the page cache does the work. This frees
+   ~27 GB — which is what makes CUDA graphs and a 200K window fit at all.
+   On unified memory it is the *only* offload that returns real memory (see
+   the `VLLM_PLE_CPU_OFFLOAD` trap in [docs/REPRODUCE.md](docs/REPRODUCE.md)).
+3. **Decode is bandwidth-bound, so the campaign moved fewer bytes**:
+   weight-only FP8 (E4M3, per-channel, Marlin) for the dense projections and
+   both lm_heads, CuteDSL skinny GEMMs for the tiny per-step matmuls, and two
+   host-stall fixes. Each step now streams ~10.2 GB of weights at 76 % of the
+   GB10's 246 GB/s pure-read ceiling.
 
 | Checkpoint | Size | Engine |
 |---|---|---|
@@ -37,130 +88,101 @@ Sizes for context:
 | Official FP8 | 173 GB | vLLM |
 | Inferact NVFP4 | 182.8 GB | vLLM |
 | RadixArk W4A4 | 135 GB | vLLM |
-| Unsloth GGUF (dynamic, sub-4-bit) | 74–111 GB | llama.cpp |
-| This checkpoint | 109 GB | vLLM |
+| Unsloth GGUF (dynamic, sub-4-bit) | 74–111 GB | llama.cpp only |
+| **This checkpoint** | **109 GB** | **vLLM** |
 
-109 GB is about the floor for the NVFP4 format (~4.5 bits/param over experts +
-PLE). Smaller checkpoints (like the 74 GB GGUF) use sub-4-bit formats that
-NVFP4 can't express, in a llama.cpp-only format.
+## The patches (11, applied in lexical order)
 
-## Checkpoint contents
-
-| Component | Format | Size |
-|---|---|---|
-| Routed experts (48×512 + MTP experts) | NVFP4 | 67.95 GB |
-| PLE / n-gram table (51.2B params) | NVFP4 | 28.80 GB |
-| MTP layers | mixed | 1.42 GB |
-| Attention, embeddings, gates, norms, vision tower | BF16 (unchanged) | 10.98 GB |
-| **Total** | | **109.18 GB** |
-
-Quantized in one step from the official BF16 release. `input_scale` values are
-calibration-derived from the RadixArk release (×1.25). Verified by byte-parity
-against a ModelOpt reference, a sweep over all scale tensors, and dequantization
-error checks (~0.094 relative). One caveat: ~0.2 % of bytes (the tails of 3
-shards) were regenerated on CPU after a download truncation; they differ from
-the originals only in half-ULP rounding ties and verify identically.
-
-## Serving
-
-Needs a vLLM build with Flash-Next (Qwen4Exp) support plus the patches in this
-repo. A prebuilt arm64 image with all six patches:
-
-```
-docker.io/jstarkg/vllm-gb10-flashnext:0.28-sm121-r6
-```
-
-(the Dockerfile here reproduces the patch application.)
-
-```bash
-VLLM_PLE_NVFP4=1 VLLM_PLE_NVFP4_MMAP=1 VLLM_PLE_NVFP4_MMAP_PREWARM=1 \
-vllm serve /path/to/flashnext-nvfp4 \
-  --served-model-name qwen3.8-flash-next \
-  --quantization modelopt_fp4 --moe-backend marlin \
-  --gpu-memory-utilization 0.78 --max-model-len 131072 \
-  --max-num-batched-tokens 8192 --max-num-seqs 16 \
-  --load-format runai_streamer \
-  --model-loader-extra-config '{"concurrency":16,"memory_limit":4294967296}' \
-  --enable-prefix-caching --mamba-cache-mode align \
-  --reasoning-parser qwen3 \
-  --enable-auto-tool-choice --tool-call-parser qwen3_coder \
-  --compilation-config '{"cudagraph_mode":"PIECEWISE","cudagraph_capture_sizes":[1,2,4,8,16],"splitting_ops":["vllm::unified_attention_with_output","vllm::unified_mla_attention_with_output","vllm::mamba_mixer2","vllm::mamba_mixer","vllm::short_conv","vllm::qwen3_8_flash_next_ple_short_conv","vllm::qwen3_8_flash_next_qsa_with_output","vllm::linear_attention","vllm::qwen_gdn_attention_core","vllm::qwen_gdn_attention_core_fused_norm_packed","vllm::sparse_attn_indexer","vllm::ple_nvfp4_mmap_lookup"]}' \
-  --speculative-config '{"method":"qwen3_8_flash_next_mtp","num_speculative_tokens":1}'
-```
-
-Notes:
-- `--moe-backend marlin`: on sm120/121 Marlin is the working NVFP4 path.
-  `10-…thread-config.patch` fixes an sm121 thread-config bug (vllm#37030
-  class) that otherwise corrupts output. The FlashInfer b12x CUTLASS MoE
-  backend faults (Xid 31) at JIT warmup on sm121 with current
-  nvidia-cutlass-dsl releases — don't bother until FlashInfer validates it.
-- `VLLM_PLE_NVFP4_MMAP=1` (`35-ple-nvfp4-mmap.patch`) serves the 28.8 GB
-  4-bit PLE table from NVMe via mmap instead of keeping it resident: a token
-  reads 16 rows × 90 B, so the page cache does the work. Frees ~27 GB —
-  which is what makes CUDA graphs and the 131K window fit. Costs ~0 at
-  decode (the table was never the bottleneck). On unified-memory machines
-  this is the only offload that returns real memory; a CPU-offload process
-  just moves the allocation within the same pool.
-- CUDA graphs: piecewise mode with the splitting-op list shown (the mmap
-  lookup op must run outside capture). With the table resident there is no
-  capture headroom on a 121 GB card — the mmap patch is the enabler.
-- `--load-format runai_streamer`: 674 s → 198 s model load on GB10, whose
-  pageable host-to-device copies are the real bottleneck (~50× slower than
-  pinned).
-- `--kv-cache-dtype fp8` does not work: the model's QSA attention requires a
-  BF16 main KV cache and rejects it at startup.
-- **Prefix caching crashes this model's day-one tree.** Patches 40 and 41 fix
-  it; both flags above are required, explicitly. Read
-  [docs/PREFIX-CACHING.md](docs/PREFIX-CACHING.md) before enabling — including
-  the testing methodology, because the failure mode passes uniform tests.
-
-## Measured (DGX Spark GB10)
-
-| Config | Decode speed |
+| Patch | What it does |
 |---|---|
-| eager | 16.8 tok/s |
-| eager + MTP (k=1, 80 % acceptance) | 24.6 tok/s |
-| full config above (mmap PLE + piecewise graphs + MTP + prefix caching) | 24.8–25.5 tok/s |
+| `10-sm121-marlin-thread-config` | fixes an sm121 Marlin thread-config bug (vllm#37030 class) that silently corrupts output |
+| `20-ple-4bit-loader` | loads the packed NVFP4 PLE table (env `VLLM_PLE_NVFP4`) |
+| `30-ple-graph-output-buffer` | makes the 4-bit PLE path CUDA-graph-capture-safe |
+| `35-ple-nvfp4-mmap` | serves the PLE table from NVMe page cache (env `VLLM_PLE_NVFP4_MMAP`) |
+| `40-mamba-eagle-drop` | prefix-cache crash with speculative decoding (from vllm#48375) |
+| `41-mamba-state-seed` | prefix-cache crash on resume (from vllm#53142) |
+| `50-jalapeno-fp8-proj` | weight-only FP8 Marlin for the three big dense projections (env `VLLM_JALAPENO_FP8_PROJ=proj`) — ×1.28 decode |
+| `51-jalapeno-fp8-lmhead` | the same treatment for the main and draft lm_heads (`proj,lmhead`) — +12 % more |
+| `52-jalapeno-skinny-gemm-gb10` | ships the model's CuteDSL skinny GEMM on GB10 for small-M matmuls (env `VLLM_JALAPENO_SKINNY`) |
+| `53-jalapeno-async-attn-meta-h2d` | pinned async H2D for attention metadata — removes a 13.7 ms median host sync per decode step |
+| `54-jalapeno-layer-name-cache` | memoizes torch LayerName opaques — 96 reconstructions per step eliminated |
 
-With the full config: boot ~6.5 min (198 s weight load), cached conversation
-turns drop from ~10 s to ~2–3 s of prefill, cache hit rate 56–70 % on
-conversation-shaped traffic, 131,072-token context (a 46K-token prompt answers
-in ~25 s). Reasoning and tool-calling verified through an OpenAI-compatible
-gateway. Decode numbers are clock-sensitive — GB10's DVFS parks bandwidth-bound
-decode well below max clocks, so log `clocks.sm` alongside any benchmark.
+All are Python-level over a digest-pinned vLLM base — no kernel rebuilds.
+The Dockerfile *asserts* every patch landed (markers + compile checks), so a
+half-applied patch fails the build instead of surfacing as garbled output at
+inference time. Every Jalapeño patch is env-gated and inert when unset.
 
-## Contents
+## Knobs
 
-- `docs/REPRODUCE.md` — **the end-to-end guide**: quantize, patch, serve,
-  verify, plus the optional FP8-periphery calibration and a list of every
-  trap that cost us time
-- `docs/PREFIX-CACHING.md` — why prefix caching crashes GDN hybrids, the two
-  fixes, and how to test cache changes so they can't lie to you
-- `quantize/` — the quantization pipeline: `quantlib.py` (NVFP4 packing math),
-  `quantdriver.py` (incremental, resumable BF16 → NVFP4 driver),
-  `apply_ple_nvfp4_patch.py` (generates the PLE loader patch)
-- `patches/` — six vLLM patches (apply with `patch -p1` in vLLM's
-  site-packages, lexical order): sm121 Marlin thread config, the 4-bit PLE
-  loader, a graph-safe PLE output buffer, PLE-from-NVMe mmap, and two
-  prefix-caching fixes ported from unmerged upstream PRs (vllm#48375,
-  vllm#53142)
-- `serve/` — `serve.sh` (the serving command with every load-bearing flag
-  explained), `gates.py` (coherence → tools → speed-with-clocks acceptance),
-  `soak.py` (seeded varied-geometry soak with killer-replay), and
-  `test_ple_mmap_parity.py` (offline bit-identity proof for the mmap patch)
-- `calibrate/` — optional FP8-periphery path: activation-max calibration
-  server, its Dockerfile, and the `input_scale` graft
-- `Dockerfile` — reproduces the serving image (asserts all six patches applied)
-- `upload/` — Hugging Face upload tooling + weights model card
-- `LICENSE` — Qwen Community License 1.0 (inherited from the base model)
+`serve/serve.sh` reads these from the environment (the compose file sets the
+production values):
+
+| Var | Default | Meaning |
+|---|---|---|
+| `PORT` | 8000 | listen port (compose uses 8006) |
+| `CTX` | 131072 | context window; 204800 validated, 262144 native max |
+| `SEQS` | 16 | max concurrent sequences |
+| `GPU_MEM` | 0.78 | `--gpu-memory-utilization`; stay in 0.78–0.85 on GB10 |
+| `MTP` | 2 | speculative tokens (0 off). 2 = production: +4 % single-stream, −1–2 % at c8–c16 |
+| `CACHE` | 1 | prefix caching (requires patches 40+41, both in this image) |
+| `MMAP` / `PREWARM` | 1 / 1 | PLE table from NVMe; prewarm fills the page cache at boot |
+| `SLEEP_MODE` | 0 | expose `/sleep`, `/wake_up`, `/is_sleeping` |
+| `FP8_PROJ` | proj,lmhead | Jalapeño patch 50/51 selection; empty disables |
+| `SKINNY` | hc,router,ba,indexer | Jalapeño patch 52 GEMM families; empty disables |
+| `ASYNC_H2D` | 1 | patch 53; 0 restores blocking copies |
+| `LAYER_NAMES` | 1 | patch 54; 0 restores per-call construction |
+
+## GB10 platform notes
+
+The traps that cost real time, condensed — the long versions with evidence
+live in [docs/REPRODUCE.md](docs/REPRODUCE.md):
+
+- **`GPU_MEM` above ~0.85 risks collapse**: GB10 reports reclaimable page
+  cache as free memory, so vLLM's probe over-estimates (vllm#35313).
+- **Benchmarks without `clocks.sm` logged are void** — GB10's DVFS parks
+  bandwidth-bound decode well below max clocks on its own.
+- **A second CUDA context cannot coexist with the resident engine** on
+  121 GiB unified memory (host-OOM risk). Run kernel microbenches only with
+  the engine stopped, or in CPU-only containers.
+- FlashInfer's b12x CUTLASS MoE backend faults (Xid 31) on sm121 — Marlin is
+  both the working and the faster path today.
+- `--kv-cache-dtype fp8` is rejected by this model's QSA attention.
+- Mamba/GDN prefix-cache bugs are geometry-dependent: uniform test prompts
+  pass while varied geometry crashes. `serve/soak.py` exists for exactly this
+  reason — use it after any cache or kernel change.
+
+One honest caveat from weeks of production: our Spark showed intermittent
+NVRM `NV_ERR_NO_MEMORY` bursts under heavy load. This class predates this
+stack (it reproduced with an unmodified engine and other workloads), and the
+serving config above was validated stable across the campaign — but if you
+push the box hard, watch `dmesg`, and don't attribute it to the patches.
+
+## Repository contents
+
+- `docs/PERFORMANCE.md` — the Jalapeño campaign: promotion chain, decode
+  anatomy, what failed and why, measurement methodology
+- `docs/REPRODUCE.md` — end-to-end: quantize from the official BF16 release,
+  build, serve, verify — every trap listed
+- `docs/PREFIX-CACHING.md` — why prefix caching crashes GDN hybrids and how
+  to test cache changes so they can't lie to you
+- `patches/` — the eleven vLLM patches
+- `serve/` — `serve.sh`, `gates.py` (acceptance gates), `soak.py` (seeded
+  varied-geometry soak with killer-replay), `test_ple_mmap_parity.py`
+  (offline bit-identity proof for the mmap path)
+- `quantize/` — the incremental, resumable BF16 → NVFP4 pipeline (incl. the
+  PLE table) and the loader-patch generator
+- `calibrate/` — optional activation-max calibration for a checkpoint-level
+  FP8 periphery
+- `docker-compose.yml` + `.env.example` — the production serving stack
+- `upload/` — Hugging Face upload tooling + the weights model card
 
 ## License and credit
 
 Weights are a derivative of
 [Qwen/Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next)
-under the Qwen Community License 1.0 (included). Patches and Dockerfile:
-Apache-2.0.
+under the Qwen Community License 1.0 (included). Patches, Dockerfile, and
+tooling: Apache-2.0.
 
 Thanks to: Qwen (base model), RadixArk (calibration scales), Unsloth (the
-4-bit n-gram precedent), namake-taro/vllm-custom (sm121 thread-config insight),
-NVIDIA (sm121 vLLM enablement, upstream in 0.28).
+4-bit n-gram precedent), namake-taro/vllm-custom (sm121 thread-config
+insight), NVIDIA (sm121 vLLM enablement, upstream in 0.28).

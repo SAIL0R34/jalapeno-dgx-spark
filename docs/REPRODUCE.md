@@ -2,8 +2,8 @@
 
 How to take the official 335 GB Qwen3.8-Flash-Next release and end up with a
 109 GB NVFP4 checkpoint serving through vLLM on a single 121 GB GPU, with
-speculative decoding, CUDA graphs, a 131K context window and prefix caching all
-working at once.
+MTP=2 speculative decoding, CUDA graphs, a 200K context window and prefix
+caching all working at once.
 
 Everything here was done on a DGX Spark (GB10, sm121, 121 GB unified memory).
 Most of it applies to any single-GPU NVFP4 Flash-Next deployment; the parts that
@@ -79,8 +79,10 @@ us to the trap:
 
 ## 2. Build the vLLM image (`patches/`, `Dockerfile`)
 
-Six patches, applied over vLLM's `site-packages` in lexical order. All are
-Python-level; no kernel rebuild.
+Eleven patches, applied over vLLM's `site-packages` in lexical order. All are
+Python-level; no kernel rebuild. Patches 50–54 are the "Project Jalapeño"
+decode optimizations — env-gated, inert when their env vars are unset, and
+worth **+52 % decode** together (see [PERFORMANCE.md](PERFORMANCE.md)).
 
 | Patch | What it fixes |
 |---|---|
@@ -90,6 +92,11 @@ Python-level; no kernel rebuild.
 | `35-ple-nvfp4-mmap` | Serves the PLE table from NVMe via mmap instead of keeping it resident. Frees ~27 GB. |
 | `40-mamba-eagle-drop` | Prefix-cache crash with speculative decoding (ported from unmerged vllm#48375). |
 | `41-mamba-state-seed` | Prefix-cache crash on resume, wrong block-size divisor (from vllm#53142). |
+| `50-jalapeno-fp8-proj` | Weight-only FP8 (E4M3, per-channel) via Marlin for the three bandwidth-dominant dense projections. ×1.28 decode. Env `VLLM_JALAPENO_FP8_PROJ=proj`. |
+| `51-jalapeno-fp8-lmhead` | Extends patch 50 to the main and draft `lm_head`s. +12 % more decode. Env value `proj,lmhead`. |
+| `52-jalapeno-skinny-gemm-gb10` | Activates the model's shipped CuteDSL skinny GEMM on GB10 for the small-M matmuls Marlin loses money on (hc/router/ba/indexer families). Env `VLLM_JALAPENO_SKINNY`. |
+| `53-jalapeno-async-attn-meta-h2d` | Pinned non-blocking H2D for per-request attention-metadata index tensors — removes a 6–16 ms (median 13.7) CPU stall present in 56 % of decode steps. Env `VLLM_ASYNC_ATTN_METADATA_H2D`. |
+| `54-jalapeno-layer-name-cache` | Memoizes torch `LayerName` value-type opaques (96 constructions per decode step, ~11.7 µs each). Env `VLLM_CACHE_LAYER_NAMES`. |
 
 ```bash
 docker build -t flashnext-vllm:local .
@@ -133,8 +140,11 @@ single boot.
 CKPT=/path/to/flashnext-nvfp4 ./serve/serve.sh
 ```
 
-Knobs: `CTX` (default 131072), `SEQS`, `GPU_MEM`, `MTP` (0 disables
-speculation), `CACHE` (0 disables prefix caching), `MMAP`, `PREWARM`.
+Knobs: `CTX` (default 131072; 204800 is the production window — the script
+sets `VLLM_ALLOW_LONG_MAX_MODEL_LEN` automatically above 131072), `SEQS`,
+`GPU_MEM`, `MTP` (default 2; 0 disables speculation), `CACHE` (0 disables
+prefix caching), `MMAP`, `PREWARM`, `SLEEP_MODE`, and the Jalapeño gates
+`FP8_PROJ`, `SKINNY`, `ASYNC_H2D`, `LAYER_NAMES` (see README for the table).
 
 The flags that are load-bearing, and why:
 
@@ -243,18 +253,25 @@ before writing.
 
 ## 6. Measured results
 
-DGX Spark GB10, this checkpoint, full configuration:
+DGX Spark GB10, this checkpoint, full configuration (patches 50–54 on, MTP=2
+— the `r10` production baseline; the step-by-step story of how these numbers
+were reached is in [PERFORMANCE.md](PERFORMANCE.md)):
 
 | | |
 |---|---|
-| Decode, single stream | 24.8–25.5 tok/s (MTP k=1, ~80% acceptance) |
-| Decode without speculation | ~16.8 tok/s |
+| Decode, single stream | 37.3–38.0 accepted tok/s (MTP k=2, p₂ ≈ 0.62) |
+| Decode without speculation, no Jalapeño patches | ~16.8 tok/s (r6-era eager) |
+| Decode without Jalapeño patches, MTP k=1 | 24.8–25.5 tok/s (the r6 anchor) |
+| Concurrency 4 / 8 / 16 | 21.2 / 14.6 / 10.5 tok/s aggregate |
+| Agent fanout (8 parallel) | 23.8 tok/s aggregate, TTFT p90 6.06 s |
+| ITL p50 | 56.8 ms |
 | Boot | ~6.5 min (198 s weight load) |
 | Resident weights | 75.94 GB (from 102.76 GB before the mmap patch) |
-| KV pool | 12–14.7 GB, ~350–590K tokens |
-| Context | 131,072 (46K-token prompt answers in ~25 s) |
+| KV pool | ~26 KiB/token (BF16 QSA) ≈ 40K tokens/GiB |
+| Context | 131,072 default; 204,800 production (46K-token prompt answers in ~25 s) |
 | Cached conversation turns | ~10 s cold → ~2–3 s |
 | Cache hit rate | 56–70% on conversation-shaped traffic |
+| Quality | 13/13 battery, KL ≤ 0.0121 vs unpatched engine |
 
 ---
 
@@ -271,3 +288,10 @@ DGX Spark GB10, this checkpoint, full configuration:
    machine that holds the only copy.
 9. FP8 weight conversion without calibrated activation scales produces a fast,
    confident, wrong model.
+10. A second CUDA context cannot coexist with the resident engine on 121 GiB
+    unified memory (host-OOM risk). Run kernel microbenchmarks only in
+    stopped-engine windows, or in CPU-only containers.
+11. More precision reduction is not more speed: W4A16/NVFP4 on the remaining
+    BF16 families was measured and rejected — those GEMMs are latency-bound
+    (kernel floor ~19–21 µs), so fewer bytes don't become less time, and
+    4-bit weight error is ~3.6× FP8's. The byte floor is elsewhere.
