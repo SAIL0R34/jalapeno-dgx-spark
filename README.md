@@ -2,6 +2,8 @@
 
 ![platform](https://img.shields.io/badge/target-DGX_Spark_GB10_%2F_sm121-76b900) ![weights](https://img.shields.io/badge/weights-Qwen_Community_License_1.0-blue) ![code](https://img.shields.io/badge/patches_%2B_tooling-Apache--2.0-orange)
 
+![Project Jalapeño results — interactive decode throughput 24.2 → 37.6 tok/s (+54 %) on the same DGX Spark](docs/img/jalapeno-results.jpg)
+
 A tuned vLLM stack that runs the 335 GB **Qwen3.8-Flash-Next** on a single
 **NVIDIA DGX Spark** (GB10, 121 GB unified memory) as a full OpenAI-compatible
 endpoint — tool calling, reasoning parsing, prefix caching, 200K context,
