@@ -1,0 +1,309 @@
+--- a/vllm/models/qwen3_8_flash_next/nvidia/low_latency_gemm.py	2026-09-05 00:00:00.000000000 +0000
++++ b/vllm/models/qwen3_8_flash_next/nvidia/low_latency_gemm.py	2026-09-05 00:00:00.000000000 +0000
+@@ -5,8 +5,21 @@
+ Dispatch follows Kimi-K3 and uses the local ``(N, K)`` shape and token count.
+ Plans contain measured CUDA graph capture sizes; other token counts use the
+ standard linear implementation.
++
++BCN-JAL-G1 (Project Jalapeño cand-G1, M5): additionally activates the same
++shipped CuteDSL skinny GEMM on GB10/sm_121 at TP=1, env-gated via
++``VLLM_JALAPENO_SKINNY`` (comma-separated family tokens ``hc,router,ba,
++indexer`` — plus the opt-in ``shared`` for A/B of the concurrency-hidden
++shared expert). Unset/0 keeps today's cuBLAS wmma path bit-for-bit: no
++quant_method is swapped and no plan key matches. sm_103 behavior (TP=4 plan
++table, unconditional swap) is unchanged. Compile failures at warmup or first
++use fall back to ``F.linear`` (cuBLAS) with the route poisoned.
+ """
+ 
++import logging
++import os
++from functools import partial
++
+ import torch
+ from torch import nn
+ 
+@@ -23,6 +36,8 @@
+ from vllm.platforms import current_platform
+ from vllm.utils.torch_utils import direct_register_custom_op
+ 
++logger = logging.getLogger("vllm.qwen3_8_flash_next.low_latency_gemm")
++
+ QWEN38NEXT_GEMM_PLANS: dict[tuple[int, int], dict[int, SkinnyGemmConfig]] = {
+     # GDN fused QKVZ projection, TP=4.
+     (4096, 2560): {
+@@ -78,11 +93,119 @@
+     },
+ }
+ 
++# ---------------------------------------------------------------------------
++# BCN-JAL-G1: TP=1 (GB10/sm_121) production shapes (torch W[N, K]; y = x@W.T).
++# Recipes for (336,10240) and (640,2560) are inherited from the table above
++# (both keys already match TP=1 exactly); the rest mirror same-shape-class
++# TP=4 recipes. Config constraints enforced by the kernel wrapper:
++# block_size % 32 == 0, N % outputs_per_block == 0,
++# K % (block_size*vector_width) == 0, and static_k must hold >= 2 whole tiles.
++# ---------------------------------------------------------------------------
++JALAPENO_SKINNY_ENV = "VLLM_JALAPENO_SKINNY"
++
++# family token -> {(N, K)} of the TP=1 weight shapes it covers.
++JALAPENO_SKINNY_FAMILIES: dict[str, set[tuple[int, int]]] = {
++    # hyper-connection mixers: merged down+inject [336,10240] (x98/step),
++    # final-mixer down [320,10240] (x2), up [10240,320] (x100).
++    "hc": {(336, 10240), (320, 10240), (10240, 320)},
++    "router": {(512, 2560)},  # MoE router gate, x49/step
++    "ba": {(96, 2560)},  # GDN merged b[48]+a[48] projection, x36/step
++    "indexer": {(640, 2560)},  # QSA indexer q/k, x13/step
++    # Shared expert is 98-101% concurrency-hidden under the routed experts
++    # (M5 WMMA inventory C3); NOT in the default set — opt-in A/B only.
++    "shared": {(1280, 2560), (2560, 640)},
++}
++_JALAPENO_SKINNY_DEFAULT = ("hc", "router", "ba", "indexer")
++
++JALAPENO_GEMM_PLANS: dict[tuple[int, int], dict[int, SkinnyGemmConfig]] = {
++    # HC up (input_mix_weight_up). K=320 admits only block_size=32 x
++    # vector_width=2 (tile 64 | 320); static_k=320 enables the PDL
++    # pre-griddepcontrol_wait weight prefetch (5 tiles, 2 prefetched).
++    (10240, 320): {
++        1: SkinnyGemmConfig(1, 32, 2, vector_width=2, static_k=320),
++        2: SkinnyGemmConfig(2, 32, 2, vector_width=2, static_k=320),
++        4: SkinnyGemmConfig(4, 32, 2, vector_width=2, static_k=320),
++    },
++    # HC final-mixer down (use_combine=False, no inject column).
++    (320, 10240): {
++        1: SkinnyGemmConfig(1, 128, 1, static_k=10240),
++        2: SkinnyGemmConfig(2, 128, 1, static_k=10240),
++        4: SkinnyGemmConfig(4, 128, 2, static_k=10240),
++    },
++    # MoE router gate; recipe mirrors the TP=4 (320,2560) shared key.
++    (512, 2560): {
++        1: SkinnyGemmConfig(1, 128, 2, k_unroll=4, vector_width=4),
++        2: SkinnyGemmConfig(2, 128, 2, k_unroll=4, vector_width=4),
++        4: SkinnyGemmConfig(4, 128, 2, k_unroll=4, vector_width=4),
++    },
++    # GDN merged B/A projection, replicated at TP=1 (TP=4 key was (24,2560)).
++    (96, 2560): {
++        1: SkinnyGemmConfig(1, 128, 2, k_unroll=4, vector_width=4),
++        2: SkinnyGemmConfig(2, 128, 2, k_unroll=4, vector_width=4),
++        4: SkinnyGemmConfig(4, 128, 2, k_unroll=4, vector_width=4),
++    },
++    # Shared-expert fused gate/up (opt-in "shared" token only).
++    (1280, 2560): {
++        1: SkinnyGemmConfig(1, 128, 2, k_unroll=4, vector_width=4),
++        2: SkinnyGemmConfig(2, 128, 2, k_unroll=4, vector_width=4),
++        4: SkinnyGemmConfig(4, 128, 2, k_unroll=4, vector_width=4),
++    },
++    # Shared-expert down (opt-in "shared" token only); tile 128 | 640.
++    (2560, 640): {
++        1: SkinnyGemmConfig(1, 32, 2, k_unroll=2, vector_width=4),
++        2: SkinnyGemmConfig(2, 32, 2, k_unroll=2, vector_width=4),
++        4: SkinnyGemmConfig(4, 32, 2, k_unroll=2, vector_width=4),
++    },
++}
++
++# Routes (N, K, M) that failed at runtime; they stay on cuBLAS afterwards.
++_failed_routes: set[tuple[int, int, int]] = set()
++
++# Resolved plan table; computed once (arch + env are fixed for the process).
++_effective_plans: dict[tuple[int, int], dict[int, SkinnyGemmConfig]] | None = None
++
+ 
+ def _is_sm103() -> bool:
+     return current_platform.is_device_capability((10, 3))
+ 
+ 
++def _is_sm121() -> bool:
++    return current_platform.is_device_capability((12, 1))
++
++
++def _jalapeno_tokens() -> set[str]:
++    mode = os.environ.get(JALAPENO_SKINNY_ENV, "0").strip().lower()
++    if not mode or mode in ("0", "off", "false", "no"):
++        return set()
++    if mode in ("1", "on", "true", "yes"):
++        return set(_JALAPENO_SKINNY_DEFAULT)
++    tokens = {token.strip() for token in mode.split(",") if token.strip()}
++    if "all" in tokens:
++        return set(JALAPENO_SKINNY_FAMILIES)
++    return tokens & set(JALAPENO_SKINNY_FAMILIES)
++
++
++def _resolve_effective_plans() -> dict[tuple[int, int], dict[int, SkinnyGemmConfig]]:
++    global _effective_plans
++    if _effective_plans is None:
++        if _is_sm103():
++            # sm_103: the shipped TP=4 table, exactly as before.
++            _effective_plans = QWEN38NEXT_GEMM_PLANS
++        else:
++            shapes: set[tuple[int, int]] = set()
++            for token in _jalapeno_tokens():
++                shapes |= JALAPENO_SKINNY_FAMILIES[token]
++            if shapes and _is_sm121() and shape_dynamic_skinny_gemm.is_available():
++                merged = dict(QWEN38NEXT_GEMM_PLANS)
++                merged.update(JALAPENO_GEMM_PLANS)
++                _effective_plans = {
++                    key: plan for key, plan in merged.items() if key in shapes
++                }
++            else:
++                _effective_plans = {}
++    return _effective_plans
++
++
+ def _is_packed_row_major(tensor: torch.Tensor) -> bool:
+     return tensor.dim() == 2 and tensor.stride() == (tensor.shape[1], 1)
+ 
+@@ -126,14 +249,29 @@
+ 
+ 
+ def _qwen38next_low_latency_gemm(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+-    plan = QWEN38NEXT_GEMM_PLANS.get((weight.shape[0], weight.shape[1]))
++    plans = _resolve_effective_plans()
++    plan = plans.get((weight.shape[0], weight.shape[1]))
+     config = None if plan is None else plan.get(x.shape[0])
+     if (
+         config is not None
+         and _runtime_ok(x, weight)
+         and shape_dynamic_skinny_gemm.is_available()
+     ):
+-        return shape_dynamic_skinny_gemm(x, weight, config)
++        route = (weight.shape[0], weight.shape[1], x.shape[0])
++        if route not in _failed_routes:
++            try:
++                return shape_dynamic_skinny_gemm(x, weight, config)
++            except Exception as exc:  # noqa: BLE001 - fall back to cuBLAS
++                _failed_routes.add(route)
++                logger.warning(
++                    "low-latency skinny GEMM failed for (N=%d, K=%d, M=%d) "
++                    "(%s: %s); falling back to cuBLAS for this route",
++                    route[0],
++                    route[1],
++                    route[2],
++                    type(exc).__name__,
++                    exc,
++                )
+     return torch.nn.functional.linear(x, weight)
+ 
+ 
+@@ -150,15 +288,13 @@
+ )
+ 
+ 
+-def enable_qwen38next_low_latency_gemm(
+-    module: nn.Module,
+-    dtype: torch.dtype,
+-) -> None:
+-    if dtype != torch.bfloat16 or not _is_sm103():
+-        return
+-    if not shape_dynamic_skinny_gemm.is_available():
+-        return
++def _swap_low_latency_methods(module: nn.Module) -> set[SkinnyGemmConfig]:
++    """Swap quant_method on modules whose (N,K) has a plan; return the configs.
+ 
++    Shared by the sm_103 path (original semantics) and the jalapeno sm_121
++    path (plan table pre-filtered to the env-enabled families).
++    """
++    plans = _resolve_effective_plans()
+     warmup_configs: set[SkinnyGemmConfig] = set()
+     for child in module.modules():
+         is_linear = (
+@@ -174,7 +310,7 @@
+         weight = getattr(child, "weight", None)
+         if weight is None or weight.dim() != 2:
+             continue
+-        plan = QWEN38NEXT_GEMM_PLANS.get((weight.shape[0], weight.shape[1]))
++        plan = plans.get((weight.shape[0], weight.shape[1]))
+         if plan is None:
+             continue
+         if is_linear:
+@@ -182,6 +318,91 @@
+         else:
+             child.quant_method = Qwen38NextLowLatencyEmbeddingMethod()
+         warmup_configs.update(plan.values())
++    return warmup_configs
++
++
++class _JalapenoSkinnyWarmupProvider:
++    """CuTeDSL warmup provider that tolerates compile failure on sm_121.
++
++    The stock request_warmup_configs path lets a cute.compile exception abort
++    engine startup; for cand-G1 a failure must instead leave the route on
++    cuBLAS (the dispatcher poisons the route when it next sees it).
++    """
++
++    def __init__(self, dtype: torch.dtype, configs: set[SkinnyGemmConfig]) -> None:
++        self._dtype = dtype
++        self._configs = configs
++
++    def _safe_compile(self, dtype: torch.dtype, config: SkinnyGemmConfig) -> None:
++        try:
++            shape_dynamic_skinny_gemm._compile(dtype, config, False)
++        except Exception as exc:  # noqa: BLE001 - degrade to cuBLAS fallback
++            routes = [
++                (n, k, config.num_rows)
++                for (n, k), plan in _resolve_effective_plans().items()
++                if config in plan.values()
++            ]
++            for route in routes:
++                _failed_routes.add(route)
++            logger.warning(
++                "Jalapeno cand-G1: CuTeDSL compile failed for %s (%s: %s); "
++                "%d route(s) stay on cuBLAS",
++                config,
++                type(exc).__name__,
++                exc,
++                len(routes),
++            )
++
++    def get_cutedsl_warmup_compile_units(self):
++        from vllm.model_executor.warmup.cutedsl_warmup import CuTeDSLCompileUnit
++
++        return tuple(
++            CuTeDSLCompileUnit(
++                name="jalapeno skinny GEMM",
++                key=("jalapeno-skinny-gemm", self._dtype, config),
++                compile=partial(self._safe_compile, self._dtype, config),
++            )
++            for config in sorted(
++                self._configs,
++                key=lambda c: (
++                    c.num_rows,
++                    c.block_size,
++                    c.outputs_per_block,
++                    c.k_unroll,
++                    c.vector_width,
++                    c.static_k or 0,
++                ),
++            )
++        )
+ 
+-    if warmup_configs:
++
++def enable_qwen38next_low_latency_gemm(
++    module: nn.Module,
++    dtype: torch.dtype,
++) -> None:
++    if dtype != torch.bfloat16 or not (_is_sm103() or _is_sm121()):
++        return
++    if not shape_dynamic_skinny_gemm.is_available():
++        return
++
++    warmup_configs = _swap_low_latency_methods(module)
++
++    if warmup_configs and _is_sm103():
+         shape_dynamic_skinny_gemm.request_warmup_configs(dtype, warmup_configs)
++    elif warmup_configs:
++        # sm_121 (cand-G1): env-selected families only; compile failures at
++        # warmup degrade to cuBLAS instead of aborting startup.
++        from vllm.model_executor.warmup.cutedsl_warmup import (
++            register_cutedsl_warmup_provider,
++        )
++
++        register_cutedsl_warmup_provider(
++            _JalapenoSkinnyWarmupProvider(dtype, warmup_configs)
++        )
++        logger.info(
++            "Jalapeno cand-G1: low-latency skinny GEMM armed on sm_121 for "
++            "plans %s (%s=%s)",
++            sorted(_resolve_effective_plans()),
++            JALAPENO_SKINNY_ENV,
++            os.environ.get(JALAPENO_SKINNY_ENV, ""),
++        )

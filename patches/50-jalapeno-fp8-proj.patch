@@ -1,0 +1,208 @@
+--- a/vllm/models/qwen3_8_flash_next/nvidia/model.py	2026-09-04 10:29:18.461477847 +0000
++++ b/vllm/models/qwen3_8_flash_next/nvidia/model.py	2026-09-04 10:29:18.483484165 +0000
+@@ -633,6 +633,7 @@
+         )
+         self.set_moe_parameters(self.model.layers)
+         enable_qwen38next_low_latency_gemm(self, self.model_config.dtype)
++        maybe_enable_fp8_proj(self)
+ 
+     @staticmethod
+     def get_model_state_cls():
+@@ -1045,3 +1046,7 @@
+     "Qwen3_8FlashNextModel",
+     "Qwen3_8FlashNextSparseMoeBlock",
+ ]
++
++# BCN-JAL-E1 (Project Jalapeno cand-E1, M3C): weight-only FP8(E4M3,
++# per-channel) via Marlin for bandwidth-dominant bf16 projections.
++from .jalapeno_fp8_proj import maybe_enable as maybe_enable_fp8_proj
+--- a/vllm/models/qwen3_8_flash_next/nvidia/mtp.py	2026-09-04 10:29:18.462629294 +0000
++++ b/vllm/models/qwen3_8_flash_next/nvidia/mtp.py	2026-09-04 10:29:18.483653894 +0000
+@@ -402,6 +402,7 @@
+         )
+         self.set_moe_parameters(self.model.layers)
+         enable_qwen38next_low_latency_gemm(self, vllm_config.model_config.dtype)
++        maybe_enable_fp8_proj(self)
+ 
+     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
+         return self.model.embed_input_ids(input_ids)
+@@ -445,3 +446,6 @@
+ 
+ 
+ __all__ = ["Qwen3_8FlashNextMTP", "Qwen3_8FlashNextMultiTokenPredictor"]
++
++# BCN-JAL-E1 (Project Jalapeno cand-E1, M3C)
++from .jalapeno_fp8_proj import maybe_enable as maybe_enable_fp8_proj
+--- /dev/null	2026-09-04 07:20:04.673397632 +0000
++++ b/vllm/models/qwen3_8_flash_next/nvidia/jalapeno_fp8_proj.py	2026-09-04 10:29:18.466021777 +0000
+@@ -0,0 +1,170 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: 2026 Project Jalapeño (cand-E1)
++"""BCN-JAL-E1: online weight-only FP8 (E4M3, per-output-channel) for the
++bandwidth-dominant bf16 projections of Qwen3.8-Flash-Next on GB10/sm121.
++
++Mechanism (M3C): decode-step weight streaming is at 78-95% of the pure-read
++ceiling; the only material lever is moving fewer bytes. The fork's Marlin
++FP8 w8a16 path streams half the bytes at 92-96% of the same ceiling with
++on-chip dequantization (verified: m3_tests/fp8_marlin_bench.py, graph
++capture bitwise-safe). Small families regress under marlin and are left
++bf16; marlin is ~2.9x slower than nvjet at prefill M, so dispatch is:
++
++  M <= VLLM_JALAPENO_FP8_PROJ_MMAX (default 64):  marlin w8a16 fp8
++  M >  threshold: dequant row-major fp8 into a shared bf16 scratch
++                  (one per shape) and run the normal bf16 GEMM
++
++Storage: marlin-repacked fp8 (N*K/2 bytes) + row-major fp8 (N*K/2) = exactly
++the bf16 footprint — memory-neutral. Scales: bf16 per-channel after marlin
++exponent-bias fusion; fp32 copy kept for the prefill dequant.
++
++Enabled via env VLLM_JALAPENO_FP8_PROJ:
++  "proj"      -> qkvz [16384,2560], out_proj [2560,6144], qsa qkv+gate [13312,2560]
++  "proj,lmhead" -> additionally lm_head [248320,2560]
++Everything else (router, HC, shared expert, ba, indexer) stays bf16: measured
++marlin fp8 there is 0.44-1.12x — no gain.
++"""
++from __future__ import annotations
++
++import logging
++import os
++
++import torch
++
++from vllm import _custom_ops as ops
++from vllm.model_executor.layers.linear import LinearBase, UnquantizedLinearMethod
++from vllm.model_executor.layers.quantization.utils import marlin_utils
++from vllm.model_executor.layers.quantization.utils import marlin_utils_fp8 as m8
++from vllm.utils.torch_utils import direct_register_custom_op
++
++logger = logging.getLogger("vllm.jalapeno_fp8_proj")
++
++ENV = "VLLM_JALAPENO_FP8_PROJ"
++E4M3_MAX = 448.0
++
++PROJ_SHAPES = {(16384, 2560), (2560, 6144), (13312, 2560)}
++LMHEAD_SHAPE = (248320, 2560)
++
++_scratch: dict[tuple, torch.Tensor] = {}  # (n, k) -> shared bf16 dequant target
++
++
++def _m_max() -> int:
++    try:
++        return int(os.environ.get("VLLM_JALAPENO_FP8_PROJ_MMAX", "64"))
++    except ValueError:
++        return 64
++
++
++def target_shapes() -> set[tuple[int, int]]:
++    mode = os.environ.get(ENV, "0").lower()
++    shapes = set()
++    if "proj" in mode or mode in ("1", "true", "yes"):
++        shapes |= PROJ_SHAPES
++    if "lmhead" in mode or "lm_head" in mode:
++        shapes.add(LMHEAD_SHAPE)
++    return shapes
++
++
++class JalapenoFp8MarlinLinearMethod(UnquantizedLinearMethod):
++    """Weight-only FP8 E4M3 (per-channel) with marlin decode path.
++
++    create_weights/weight_loader inherited: the bf16 parameter loads
++    normally, then process_weights_after_loading quantizes+repacks it.
++    """
++
++    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
++        w = layer.weight.data
++        n, k = int(w.shape[0]), int(w.shape[1])
++        dev = w.device
++        scale32 = (w.float().abs().amax(dim=1) / E4M3_MAX).clamp_min(1e-20)
++        q = (w.float() / scale32.unsqueeze(1)).clamp(-E4M3_MAX, E4M3_MAX)
++        q = q.to(torch.float8_e4m3fn).contiguous()          # row-major, [N,K]
++        qw = m8.pack_fp8_to_int32(q, size_k_first=False).T.contiguous()
++        pn, pk = marlin_utils.marlin_padded_nk(n, k, -1)
++        qw = marlin_utils.marlin_pad_qweight(qw, n, k, pn, pk)
++        perm = torch.empty(0, dtype=torch.int, device=dev)
++        marlin_qw = ops.gptq_marlin_repack(qw, perm, pk, pn, num_bits=8)
++        s = marlin_utils.marlin_pad_scales(
++            scale32.to(torch.bfloat16).view(1, n), n, k, pn, pk, -1)
++        marlin_s = m8.fp8_fused_exponent_bias_into_scales(
++            marlin_utils.marlin_permute_scales(s, pk, pn, -1))
++        layer.marlin_qweight = marlin_qw
++        layer.marlin_scales = marlin_s
++        layer.workspace = marlin_utils.marlin_make_workspace_new(dev)
++        layer.fp8_rowmajor = q                            # prefill dequant src
++        layer.fp8_scale32 = scale32                       # fp32 per-channel
++        del layer.weight
++        layer.weight = None                              # free bf16
++
++    def apply(self, layer, x: torch.Tensor, bias: torch.Tensor | None = None):
++        return torch.ops.vllm.jalapeno_fp8_proj_linear(
++            x, layer.marlin_qweight, layer.marlin_scales, layer.workspace,
++            layer.fp8_rowmajor, layer.fp8_scale32,
++            layer.output_size, layer.input_size, bias)
++
++
++def _impl(
++    x: torch.Tensor,
++    marlin_qw: torch.Tensor,
++    marlin_s: torch.Tensor,
++    workspace: torch.Tensor,
++    fp8_row: torch.Tensor,
++    scale32: torch.Tensor,
++    n: int,
++    k: int,
++    bias: torch.Tensor | None,
++) -> torch.Tensor:
++    m = x.shape[-2]
++    if m <= _m_max():
++        return m8.apply_fp8_marlin_linear(
++            x, marlin_qw, marlin_s, workspace, n, k, bias)
++    # large-M (prefill) path: dequant into the shared bf16 scratch, bf16 GEMM
++    key = (n, k, str(x.device))
++    scratch = _scratch.get(key)
++    if scratch is None:
++        scratch = torch.empty((n, k), dtype=torch.bfloat16, device=x.device)
++        _scratch[key] = scratch
++    scratch.copy_(fp8_row)                 # fp8 -> bf16 cast
++    scratch.mul_(scale32.view(-1, 1))      # per-output-channel scale
++    return torch.nn.functional.linear(x, scratch, bias)
++
++
++def _fake(x, marlin_qw, marlin_s, workspace, fp8_row, scale32, n, k, bias):
++    return x.new_empty((*x.shape[:-1], n))
++
++
++direct_register_custom_op(
++    op_name="jalapeno_fp8_proj_linear",
++    op_func=_impl,
++    mutates_args=[],
++    fake_impl=_fake,
++)
++
++
++def maybe_enable(root: torch.nn.Module) -> None:
++    """Swap quant_method on target-shaped unquantized linears. Called at the
++    end of model __init__ (weights load afterwards through the inherited
++    loader; process_weights_after_loading performs the conversion)."""
++    shapes = target_shapes()
++    if not shapes:
++        return
++    swapped = 0
++    for child in root.modules():
++        if not isinstance(child, LinearBase):
++            continue
++        qm = getattr(child, "quant_method", None)
++        # exact-type check would miss modelopt's fallback subclasses; any
++        # unquantized-flavored method whose weights are plain bf16 works
++        if qm is None or "Unquantized" not in type(qm).__name__:
++            continue
++        if child.weight is None or child.weight.dim() != 2:
++            continue
++        if tuple(child.weight.shape) not in shapes:
++            continue
++        child.quant_method = JalapenoFp8MarlinLinearMethod()
++        swapped += 1
++    if swapped:
++        logger.info(
++            "Jalapeno cand-E1: weight-only FP8(E4M3,per-channel)/marlin on "
++            "%d linears (shapes=%s, decode-M<=%d; prefill dequant path)",
++            swapped, sorted(shapes), _m_max())

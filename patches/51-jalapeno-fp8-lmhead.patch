@@ -1,0 +1,68 @@
+--- a/vllm/models/qwen3_8_flash_next/nvidia/jalapeno_fp8_proj.py	2026-09-04 10:29:47.000000000 +0000
++++ b/vllm/models/qwen3_8_flash_next/nvidia/jalapeno_fp8_proj.py	2026-09-04 14:47:32.828767718 +0000
+@@ -33,6 +33,10 @@
+ 
+ from vllm import _custom_ops as ops
+ from vllm.model_executor.layers.linear import LinearBase, UnquantizedLinearMethod
++from vllm.model_executor.layers.vocab_parallel_embedding import (
++    ParallelLMHead,
++    UnquantizedEmbeddingMethod,
++)
+ from vllm.model_executor.layers.quantization.utils import marlin_utils
+ from vllm.model_executor.layers.quantization.utils import marlin_utils_fp8 as m8
+ from vllm.utils.torch_utils import direct_register_custom_op
+@@ -103,6 +107,22 @@
+             layer.output_size, layer.input_size, bias)
+ 
+ 
++class JalapenoFp8MarlinEmbeddingMethod(UnquantizedEmbeddingMethod):
++    """Same FP8(E4M3, per-channel)/marlin treatment for ParallelLMHead
++    (lm_head). LogitsProcessor calls quant_method.apply(lm_head, hidden)
++    — the same custom-op dispatch as the linear method applies."""
++
++    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
++        JalapenoFp8MarlinLinearMethod.process_weights_after_loading(self, layer)
++
++    def apply(self, layer, x: torch.Tensor, bias: torch.Tensor | None = None):
++        n = getattr(layer, "output_size", None) or layer.num_embeddings
++        k = getattr(layer, "input_size", None) or layer.embedding_dim
++        return torch.ops.vllm.jalapeno_fp8_proj_linear(
++            x, layer.marlin_qweight, layer.marlin_scales, layer.workspace,
++            layer.fp8_rowmajor, layer.fp8_scale32, n, k, bias)
++
++
+ def _impl(
+     x: torch.Tensor,
+     marlin_qw: torch.Tensor,
+@@ -149,8 +169,10 @@
+     if not shapes:
+         return
+     swapped = 0
++    heads = 0
+     for child in root.modules():
+-        if not isinstance(child, LinearBase):
++        is_head = isinstance(child, ParallelLMHead)
++        if not isinstance(child, LinearBase) and not is_head:
+             continue
+         qm = getattr(child, "quant_method", None)
+         # exact-type check would miss modelopt's fallback subclasses; any
+@@ -161,10 +183,14 @@
+             continue
+         if tuple(child.weight.shape) not in shapes:
+             continue
+-        child.quant_method = JalapenoFp8MarlinLinearMethod()
+-        swapped += 1
+-    if swapped:
++        if is_head:
++            child.quant_method = JalapenoFp8MarlinEmbeddingMethod()
++            heads += 1
++        else:
++            child.quant_method = JalapenoFp8MarlinLinearMethod()
++            swapped += 1
++    if swapped or heads:
+         logger.info(
+             "Jalapeno cand-E1: weight-only FP8(E4M3,per-channel)/marlin on "
+-            "%d linears (shapes=%s, decode-M<=%d; prefill dequant path)",
+-            swapped, sorted(shapes), _m_max())
++            "%d linears + %d lm_heads (shapes=%s, decode-M<=%d; prefill "
++            "dequant path)", swapped, heads, sorted(shapes), _m_max())

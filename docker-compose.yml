@@ -1,0 +1,63 @@
+# Production serving stack for Qwen3.8-Flash-Next NVFP4 on a DGX Spark (GB10).
+#
+# The defaults below are the exact configuration running in production since
+# 2026-09-06 ("r10" in docs/PERFORMANCE.md): 37-38 accepted tok/s single-stream,
+# 204K context, prefix caching, MTP=2 speculative decoding.
+#
+# Setup: copy .env.example to .env and set MODEL_DIR to the checkpoint path.
+# Boot takes ~6.5 min (198 s weight load + warmup); the healthcheck allows for it.
+services:
+  vllm:
+    image: ${IMAGE:-jalapeno/vllm-gb10-flashnext:0.28-sm121-r9}
+    container_name: ${CONTAINER_NAME:-qwen3.8-flash-next}
+    restart: unless-stopped
+    network_mode: host
+    ipc: host
+    ulimits:
+      memlock: -1
+    entrypoint: ["/bin/bash", "/recipe/serve/serve.sh"]
+    environment:
+      CKPT: /model
+      PORT: "8006"
+      CTX: "204800"       # 131072 if you want the checkpoint-declared default
+      SEQS: "16"
+      GPU_MEM: "0.785"    # 0.78-0.85 is the safe band on unified memory (vllm#35313)
+      MMAP: "1"           # PLE table from NVMe page cache (frees ~27 GB)
+      PREWARM: "0"        # 1 = stream the table once at boot (faster first tokens)
+      MTP: "2"            # speculative tokens; 0/1/2
+      CACHE: "1"          # prefix caching (needs patches 40+41 — in this image)
+      SLEEP_MODE: "1"     # exposes /sleep + /wake_up so other jobs can use the GPU
+      # Project Jalapeño patches 50-54 (see docs/PERFORMANCE.md)
+      FP8_PROJ: "proj,lmhead"
+      SKINNY: "hc,router,ba,indexer"
+      ASYNC_H2D: "1"
+      LAYER_NAMES: "1"
+      # Engine-level settings not derived by serve.sh
+      VLLM_SERVER_DEV_MODE: "1"          # required for the sleep/wake_up routes
+      VLLM_ALLOW_LONG_MAX_MODEL_LEN: "1"
+      PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
+      CUDA_DEVICE_MAX_CONNECTIONS: "1"
+      VLLM_MARLIN_USE_ATOMIC_ADD: "1"
+      VLLM_PLE_NVFP4: "1"
+      VLLM_PLE_NVFP4_MMAP: "1"
+      VLLM_PLE_NVFP4_MMAP_PREWARM: "0"
+    volumes:
+      - ${MODEL_DIR:?copy .env.example to .env and set MODEL_DIR}:/model:ro
+      - ./:/recipe:ro
+      - vllm_cache:/root/.cache/vllm
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8006/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 1200s
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+volumes:
+  vllm_cache:

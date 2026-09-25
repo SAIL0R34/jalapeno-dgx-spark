@@ -1,0 +1,84 @@
+--- a/vllm/utils/torch_utils.py	2026-09-05 00:00:00.000000000 +0000
++++ b/vllm/utils/torch_utils.py	2026-09-05 00:00:00.000000000 +0000
+@@ -961,6 +961,26 @@
+ # Set VLLM_USE_LAYERNAME=0 to disable even on torch >= 2.11.
+ _USE_LAYERNAME = HAS_OPAQUE_TYPE and envs.VLLM_USE_LAYERNAME
+ 
++# BCN-JAL-I0FIX (Project Jalapeño cand-I0, M5, fix F-B / S1): memoize the
++# LayerName value-type opaques per name. dynamo lifts these opaques as hoisted
++# graph inputs and the compiled model-forward wrapper re-executes the
++# LayerName() construction for every custom-op call site on every step (96
++# per steady decode step in the target forward + 2 in the draft forward,
++# ~11.7 us each incl. dynamo's per-object bookkeeping). LayerName is guarded
++# by value equality (its __eq__/__hash__ delegate to the wrapped string, the
++# non-default __eq__ required for value-type opaques), so returning the SAME
++# object for the SAME name is guard-neutral, allocation-free at capture time,
++# and value-identical for _resolve_layer_name consumers. Default off =
++# construct per call, exactly as before.
++# VLLM_CACHE_LAYER_NAMES_ENV is asserted by the recipe Dockerfile CHECKS.
++_CACHE_LAYER_NAMES_ENV = "VLLM_CACHE_LAYER_NAMES"
++_CACHE_LAYER_NAMES = os.environ.get(_CACHE_LAYER_NAMES_ENV, "0").lower() in (
++    "1",
++    "true",
++    "yes",
++    "on",
++)
++
+ if HAS_OPAQUE_TYPE:
+     from torch._opaque_base import OpaqueBase
+ else:
+@@ -1009,9 +1029,30 @@
+     return layer_name.value if isinstance(layer_name, LayerName) else layer_name
+ 
+ 
++# F-B memo: name -> LayerName. Populated lazily (first call per name, i.e.
++# during model init/tracing); steady-state lookups only read. Keyed by the
++# exact str every call site passes today, so equal keys share the object the
++# unpatched code would have constructed fresh.
++_LAYER_NAME_CACHE: dict[str, LayerName] = {}
++
++
+ def _encode_layer_name(layer_name: str) -> str | LayerName:
+-    """Wrap a str layer name as LayerName when enabled."""
+-    return LayerName(layer_name) if _USE_LAYERNAME else layer_name
++    """Wrap a str layer name as LayerName when enabled.
++
++    With VLLM_CACHE_LAYER_NAMES=1 (F-B) the LayerName for a given name is
++    memoized: same input string -> same object, different strings -> different
++    objects. Value semantics are unchanged (LayerName equality is string
++    equality), so dynamo guards and _resolve_layer_name behave identically.
++    """
++    if not _USE_LAYERNAME:
++        return layer_name
++    if _CACHE_LAYER_NAMES:
++        cached = _LAYER_NAME_CACHE.get(layer_name)
++        if cached is None:
++            cached = LayerName(layer_name)
++            _LAYER_NAME_CACHE[layer_name] = cached
++        return cached
++    return LayerName(layer_name)
+ 
+ 
+ # Supports XPU Graph with PyTorch versions >= 2.11.0.dev for XPU platform
+--- a/vllm/model_executor/layers/fused_moe/runner/moe_runner.py	2026-09-05 00:00:00.000000000 +0000
++++ b/vllm/model_executor/layers/fused_moe/runner/moe_runner.py	2026-09-05 00:00:00.000000000 +0000
+@@ -48,6 +48,7 @@
+ from vllm.utils.torch_utils import (
+     _USE_LAYERNAME,
+     LayerName,
++    _encode_layer_name,
+     direct_register_custom_op,
+ )
+ 
+@@ -490,7 +491,10 @@
+ 
+     def _encode_layer_name(self) -> str | LayerName:
+         if _USE_LAYERNAME:
+-            return LayerName(self.layer_name)
++            # BCN-JAL-I0FIX (F-B / S1): route through the memoizing helper in
++            # torch_utils (VLLM_CACHE_LAYER_NAMES). Flag off constructs a fresh
++            # LayerName exactly as before; flag on returns the cached object.
++            return _encode_layer_name(self.layer_name)
+         # Can be unavailable or None in unittests
+         if (
+             is_forward_context_available()

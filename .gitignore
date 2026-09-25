@@ -2,3 +2,4 @@ __pycache__/
 *.pyc
 *.safetensors
 calib_result.json
+.env

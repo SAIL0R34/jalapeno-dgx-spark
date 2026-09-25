@@ -32,6 +32,15 @@ CHECKS = [
      ["BCN81_EAGLE_DROP"]),                                     # 40: eagle-drop fix
     (f"{PKG}/v1/worker/gpu/model_states/mamba_hybrid.py",
      ["BCN81_STATE_SEED"]),                                     # 41: state-seed fix
+    (f"{PKG}/models/qwen3_8_flash_next/nvidia/low_latency_gemm.py",
+     ["BCN-JAL-G1", "JALAPENO_SKINNY_ENV",                      # 52: skinny GEMM sm121
+      "_JalapenoSkinnyWarmupProvider"]),
+    (f"{PKG}/v1/attention/backends/short_conv_attn.py",
+     ["BCN-JAL-I0FIX", "VLLM_ASYNC_ATTN_METADATA_H2D", "_maybe_async_h2d"]),  # 53
+    (f"{PKG}/utils/torch_utils.py",
+     ["BCN-JAL-I0FIX", "VLLM_CACHE_LAYER_NAMES", "_LAYER_NAME_CACHE"]),       # 54
+    (f"{PKG}/model_executor/layers/fused_moe/runner/moe_runner.py",
+     ["BCN-JAL-I0FIX", "_encode_layer_name(self.layer_name)"]),               # 54
 ]
 
 for path, markers in CHECKS:
@@ -47,7 +56,7 @@ assert marlin.count("thread_k=_sm121_") == 2, "sm121 thread-config not applied t
 ple = open(CHECKS[1][0]).read()
 assert ple.count("output.copy_(vals)") == 1, "graph output-buffer path not applied"
 assert ple.count("BCN82_PLE_NVFP4_MMAP") == 1, "mmap hook applied more than once"
-print("patch verify OK: all six patches applied and importable")
+print("patch verify OK: all eleven patches applied and importable")
 PY
 
 ENV VLLM_MARLIN_USE_ATOMIC_ADD=1 \
