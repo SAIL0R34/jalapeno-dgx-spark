@@ -67,7 +67,7 @@ a single composite):
 | 4 streams | 21.2 tok/s aggregate | expert-union grows sublinearly |
 | 8 streams | 14.6 tok/s aggregate | |
 | 16 streams | 10.5 tok/s aggregate | expert streaming near saturation |
-| Agent fanout (8 parallel CLI-agent conversations) | 23.8 tok/s aggregate, TTFT p90 6.06 s, per-stream p50 8.6 tok/s | the realistic agentic regime |
+| Agent fanout (mixed patterns, up to 8 concurrent streams, 76 requests) | 23.8 tok/s aggregate, TTFT p50 1.39 s / p90 6.06 s, per-stream p50 8.6 tok/s (min 5.8), 0 errors | the realistic agentic regime |
 | Prefill | ~250–300 ms TTFT p50 short prompts; a 32K-token needle-retrieve answers in ~17 s | weight-streaming-bound, all 512 experts activate |
 
 Decode draws ~32 W. Boot is ~6.5 min (198 s weight load via

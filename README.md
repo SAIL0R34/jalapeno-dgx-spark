@@ -1,5 +1,7 @@
 # Jalapeño — Qwen3.8-Flash-Next on a DGX Spark, fast
 
+![platform](https://img.shields.io/badge/target-DGX_Spark_GB10_%2F_sm121-76b900) ![weights](https://img.shields.io/badge/weights-Qwen_Community_License_1.0-blue) ![code](https://img.shields.io/badge/patches_%2B_tooling-Apache--2.0-orange)
+
 A tuned vLLM stack that runs the 335 GB **Qwen3.8-Flash-Next** on a single
 **NVIDIA DGX Spark** (GB10, 121 GB unified memory) as a full OpenAI-compatible
 endpoint — tool calling, reasoning parsing, prefix caching, 200K context,
@@ -15,7 +17,7 @@ published. No part of it is theoretical.
 | Single-stream decode (accepted tok/s) | **37.3–38.0** (MTP=2, all optimizations) |
 | … before the campaign, same stack | 24.2 |
 | Concurrent streams (1 / 4 / 8 / 16) | 38.7 / 21.2 / 14.6 / 10.5 tok/s |
-| Agent-style fanout (8 parallel) | 23.8 tok/s aggregate, TTFT p90 6.1 s |
+| Mixed agent fanout (up to 8 streams) | 23.8 tok/s aggregate · TTFT p50 1.4 s / p90 6.1 s · per-stream p50 8.6 tok/s · 0 errors / 76 requests |
 | Inter-token latency p50 | 56.8 ms |
 | TTFT p50 (short prompts) | ~300 ms |
 | Context | 131,072 default · 204,800 in production |
@@ -26,11 +28,25 @@ The full evidence chain — every promotion, what it won, what was tried and
 rejected, and how the numbers were measured — is in
 [docs/PERFORMANCE.md](docs/PERFORMANCE.md).
 
+## What you're running
+
+Qwen3.8-Flash-Next is a hybrid linear-attention MoE model: 48 MoE layers ×
+512 routed experts, GDN + QSA attention (most layers are context-immune,
+which is why 200K-token windows are practical), a built-in MTP draft head
+(speculative decoding is nearly free), and an unusual 51.2B-parameter PLE
+n-gram table. That table is why no published vLLM quant of this model fits
+a single GPU — they all keep it at FP8 or wider — and quantizing it is where
+this repo starts.
+
+Served through vLLM with the reasoning parser, tool-call parser
+(`qwen3_coder`), and auto tool choice enabled, so OpenAI-API clients and
+agents work unmodified.
+
 ## Quickstart
 
-You need: a DGX Spark (any 121 GB GB10 works), Docker with the NVIDIA
-runtime (the Spark ships with it), ~110 GB of NVMe for weights, and `pip
-install huggingface_hub[cli]` for the download.
+You need: a DGX Spark (any 121 GB GB10), Docker with the NVIDIA runtime
+(the Spark ships with it), ~110 GB of NVMe for weights, and
+`pip install 'huggingface_hub[cli]'` for the download.
 
 ```bash
 # 1. Weights (109 GB, public): the only single-GPU vLLM quant of this model.
@@ -45,32 +61,59 @@ docker build -t jalapeno/vllm-gb10-flashnext:0.28-sm121-r9 .
 cp .env.example .env        # then set MODEL_DIR to the path from step 1
 docker compose up -d
 docker compose logs -f      # ~6.5 min to healthy — it's loading 76 GB of weights
-
-# 4. Smoke test (stdlib only, runs on the host):
-python3 serve/gates.py --url http://localhost:8006/v1
 ```
 
-Then point anything OpenAI-compatible at `http://<spark>:8006/v1`, model name
-`qwen3.8-flash-next`, no API key:
+First request:
 
-- **Open WebUI / LibreChat / any chat UI** — add an OpenAI connection.
-- **Agents and CLI tools** — reasoning output (`--reasoning-parser qwen3`) and
-  tool calls (`--tool-call-parser qwen3_coder`, auto tool choice) already
-  parse, so OpenAI-API agents work unmodified. Prefix caching makes
-  multi-turn agents cheap: cache hit rate is 56–70 % on conversation-shaped
-  traffic, and a cached turn drops from ~10 s to ~2–3 s of prefill.
-- **Sharing the box** — the compose file enables vLLM sleep mode, so
-  `POST /sleep` frees the GPU for another job and `POST /wake_up` brings the
-  engine back without a 6.5-minute reload.
+```bash
+curl -s http://localhost:8006/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"qwen3.8-flash-next",
+       "messages":[{"role":"user","content":"Name the capital of Australia. One word."}]}' \
+| python3 -c 'import json,sys; print(json.load(sys.stdin)["choices"][0]["message"]["content"])'
+# → Canberra
+```
+
+Then run the full acceptance gates (stdlib only, runs on the host):
+`python3 serve/gates.py --url http://localhost:8006/v1` — coherence, a real
+tool call, speed with GPU clocks logged, speculative acceptance, memory.
+
+**Endpoints** (host network, port 8006): `/v1/chat/completions`,
+`/v1/completions`, `/v1/models`, `/metrics` (Prometheus, including
+speculative-decode acceptance and KV usage), `/health`, and — with
+`SLEEP_MODE=1` as shipped — `/sleep`, `/wake_up`, `/is_sleeping`.
+
+## Using it with your existing tools
+
+Point anything OpenAI-compatible at `http://<spark>:8006/v1`, model name
+`qwen3.8-flash-next`:
+
+- **Chat UIs** (Open WebUI, LibreChat, …) — add an OpenAI connection and it
+  just works, reasoning tags and tool calls already parsed server-side.
+- **Agents and coding tools** — anything speaking the OpenAI chat API works
+  unmodified. Prefix caching makes multi-turn agents cheap: 56–70 % cache
+  hit rate on conversation-shaped traffic, a cached turn drops from ~10 s to
+  ~2–3 s of prefill. Under parallel agent load expect the fanout row in the
+  table above — aggregate throughput holds up and no stream starves.
+- **Sharing the box** — `POST /sleep` releases the GPU for another job
+  (a vision sidecar, a training run); `POST /wake_up` brings the engine back
+  without restarting the container.
+
+### Security note
+
+The compose file uses host networking and the server binds `0.0.0.0` with
+**no API key** — convenient on a trusted home LAN, exposed anywhere else
+(anything that can reach the Spark can use the model *and* read
+`/metrics`, and `/sleep` lets it evict your engine). If the Spark sits
+outside your trust boundary, set `VLLM_API_KEY` (or add `--api-key` to
+`serve.sh`) or front the port with an authenticating proxy.
 
 ## Why this exists
 
 Three ideas make a 335 GB model fit and fly on a 121 GB Spark:
 
 1. **The 51.2B-parameter PLE n-gram table is quantized to NVFP4** (28.8 GB
-   instead of 102.4 GB) — every other published vLLM quant keeps it at FP8 or
-   wider, which is exactly why none of them fit one GPU. A ~130-line loader
-   patch teaches vLLM to read it.
+   instead of 102.4 GB). A ~130-line loader patch teaches vLLM to read it.
 2. **The table is served from NVMe via mmap** rather than kept resident. A
    token reads 16 rows × ~90 B, so the page cache does the work. This frees
    ~27 GB — which is what makes CUDA graphs and a 200K window fit at all.
@@ -126,11 +169,23 @@ production values):
 | `MTP` | 2 | speculative tokens (0 off). 2 = production: +4 % single-stream, −1–2 % at c8–c16 |
 | `CACHE` | 1 | prefix caching (requires patches 40+41, both in this image) |
 | `MMAP` / `PREWARM` | 1 / 1 | PLE table from NVMe; prewarm fills the page cache at boot |
-| `SLEEP_MODE` | 0 | expose `/sleep`, `/wake_up`, `/is_sleeping` |
+| `SLEEP_MODE` | 0 | expose `/sleep`, `/wake_up`, `/is_sleeping` (compose sets 1) |
 | `FP8_PROJ` | proj,lmhead | Jalapeño patch 50/51 selection; empty disables |
 | `SKINNY` | hc,router,ba,indexer | Jalapeño patch 52 GEMM families; empty disables |
 | `ASYNC_H2D` | 1 | patch 53; 0 restores blocking copies |
 | `LAYER_NAMES` | 1 | patch 54; 0 restores per-call construction |
+
+## Operations
+
+- **Update**: `git pull`, rebuild the image with a new tag, set `IMAGE=` in
+  `.env`, `docker compose up -d`. Config changes are env-only — no rebuild.
+- **Rollback**: point `IMAGE` at the previous tag (or flip the knob you
+  changed) and `docker compose up -d` again. The Jalapeño patches are
+  independently switchable via their env vars, so you can bisect a problem
+  without rebuilding anything.
+- **Sleep / share**: `curl -X POST localhost:8006/sleep` … `curl -X POST
+  localhost:8006/wake_up`. Wake reloads weights from disk, so expect a
+  multi-minute warm-up, not instant.
 
 ## GB10 platform notes
 
